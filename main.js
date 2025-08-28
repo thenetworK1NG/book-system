@@ -1,3 +1,47 @@
+// Smoothly open all previous pages in order until reaching the target page
+function openPagesThen(targetClip, done) {
+	const ordered = getOrderedPageClips();
+	const idx = ordered.indexOf(targetClip);
+	if (idx === -1) {
+		done && done();
+		return;
+	}
+	// Find all previous pages that are not open
+	const toOpen = [];
+	for (let i = 0; i < idx; i++) {
+		if (pageOpenByClip.get(ordered[i]) !== true) {
+			toOpen.push(ordered[i]);
+		}
+	}
+	if (toOpen.length === 0) {
+		done && done();
+		return;
+	}
+	// Open pages one by one
+	const [first, ...rest] = toOpen;
+	// Stop conflicting actions for the page we are about to open
+	const targets = getClipTargetNodeNames(first);
+	stopConflictingActions(targets, [first]);
+	const action = mixer.clipAction(first);
+	action.enabled = true;
+	action.setLoop(THREE.LoopOnce, 1);
+	action.clampWhenFinished = true;
+	action.reset();
+	action.timeScale = 1;
+	action.play();
+	playingDirectionByAction.set(action, 1);
+	const handler = (e) => {
+		if (e.action === action) {
+			mixer.removeEventListener('finished', handler);
+			if (rest.length > 0) {
+				openPagesThen(targetClip, done);
+			} else {
+				done && done();
+			}
+		}
+	};
+	mixer.addEventListener('finished', handler);
+}
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
@@ -20,6 +64,23 @@ let latchOpen = false;
 // Keep references to lights for UI controls
 let ambientLightRef = null;
 let directionalLightRef = null;
+let cameraInfoEl = null;
+let lastCamHudUpdate = 0;
+// Pan boundary settings (defaults enabled)
+// Defaults per user: origin [-9.121, 0.358, -3.984], radius 10, enabled true
+let panLimitEnabled = true;
+let panLimitRadius = 10; // world units
+let panOriginTarget = new THREE.Vector3(-9.121, 0.358, -3.984); // THREE.Vector3
+
+function loadPanSettings() {
+	// Intentionally disable persisted overrides; keep defaults requested by user
+	return;
+}
+
+function savePanSettings() {
+	// Persistence disabled per request to fix defaults; no-op
+	return;
+}
 
 function isMobileDevice() {
 	return (typeof window !== 'undefined') && (
@@ -64,11 +125,26 @@ function fitCameraToObject(camera, controls, object3D, offset = 1.2) {
 function initViewer() {
 	const container = document.getElementById('viewer');
 	animButtonsContainer = document.getElementById('animButtons');
+	// Remove the menu per request: hide and null out the container so no UI is built
+	if (animButtonsContainer) {
+		animButtonsContainer.style.display = 'none';
+		animButtonsContainer.innerHTML = '';
+		animButtonsContainer = null;
+	}
+	cameraInfoEl = document.getElementById('cameraInfo');
 	scene = new THREE.Scene();
 	scene.background = new THREE.Color(0xf0f0f0);
 
 	camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 1000);
-	camera.position.set(-4.459, 0.474, 21.784);
+	if (isMobileDevice()) {
+		// Mobile default view requested by user
+		camera.position.set(0.848, 2.395, 37.029);
+		// fov already 45; ensure projection updated
+		camera.fov = 45;
+		camera.updateProjectionMatrix();
+	} else {
+		camera.position.set(-4.459, 0.474, 21.784);
+	}
 
 	renderer = new THREE.WebGLRenderer({ antialias: true });
 	renderer.setSize(container.clientWidth, container.clientHeight);
@@ -83,7 +159,11 @@ function initViewer() {
 	directionalLightRef = directionalLight;
 
 	controls = new OrbitControls(camera, renderer.domElement);
-	controls.target.set(-4.459, -0.269, -0.411);
+	if (isMobileDevice()) {
+		controls.target.set(-1.148, 0.010, -4.349);
+	} else {
+		controls.target.set(-4.459, -0.269, -0.411);
+	}
 	controls.enableRotate = false; // disable rotation; allow pan and zoom
 	controls.enablePan = true;
 	controls.enableZoom = true;
@@ -94,8 +174,24 @@ function initViewer() {
 		// Keep two-finger gesture for dolly (zoom)
 		controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
 	}
+	// Mobile: set maximum zoom-in level (minDistance) to match requested view
+	if (isMobileDevice()) {
+		const maxInPos = new THREE.Vector3(-1.587, 1.381, 4.671);
+		const maxInTarget = new THREE.Vector3(-2.023, 0.861, -4.356);
+		controls.minDistance = maxInPos.distanceTo(maxInTarget);
+		// Set maximum zoom-out distance from provided far view
+		const maxOutPos = new THREE.Vector3(-6.756, 2.575, 34.772);
+		const maxOutTarget = new THREE.Vector3(-8.627, 0.340, -4.007);
+		controls.maxDistance = maxOutPos.distanceTo(maxOutTarget);
+	}
 	animate();
 	loadGLB('book.glb');
+
+	// Load persisted pan limit settings
+	loadPanSettings();
+	if (!panOriginTarget) {
+		panOriginTarget = controls.target.clone();
+	}
 
 }
 
@@ -120,10 +216,12 @@ function loadGLB(urlOrBuffer) {
 	const onLoad = (gltf) => {
 		currentModel = gltf.scene;
 		scene.add(currentModel);
-		// On mobile, set exact default view
+		// On mobile, set exact default view (requested values)
 		if (isMobileDevice()) {
-			camera.position.set(11.301, -0.011, 33.299);
-			controls.target.set(17.293, -0.499, -1.535);
+			camera.position.set(0.848, 2.395, 37.029);
+			controls.target.set(-1.148, 0.010, -4.349);
+			camera.fov = 45;
+			camera.updateProjectionMatrix();
 			controls.update();
 		}
 		// Debug: log all object names in the loaded scene
@@ -178,99 +276,12 @@ function loadGLB(urlOrBuffer) {
 			});
 			console.groupEnd();
 
-			// Generate buttons for each animation
-			if (animButtonsContainer) {
-				animButtonsContainer.innerHTML = '';
-				// Create dropdown container
-				const animGroup = document.createElement('details');
-				animGroup.style.maxWidth = '220px';
-				const animSummary = document.createElement('summary');
-				animSummary.textContent = 'Model animations';
-				animSummary.style.cursor = 'pointer';
-				animGroup.appendChild(animSummary);
-				// Rotation toggle inside dropdown
-				const rotateWrap = document.createElement('label');
-				rotateWrap.style.display = 'block';
-				rotateWrap.style.margin = '6px 0 12px 0';
-				rotateWrap.style.font = '12px sans-serif';
-				const rotateToggle = document.createElement('input');
-				rotateToggle.type = 'checkbox';
-				rotateToggle.checked = controls ? !!controls.enableRotate : false;
-				rotateWrap.appendChild(rotateToggle);
-				rotateWrap.appendChild(document.createTextNode(' Enable rotation'));
-				rotateToggle.addEventListener('change', () => {
-					const enable = !!rotateToggle.checked;
-					if (controls) {
-						controls.enableRotate = enable;
-						if (THREE.TOUCH) {
-							controls.touches.ONE = enable ? THREE.TOUCH.ROTATE : THREE.TOUCH.PAN;
-							controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
-						}
-					}
-				});
-				animGroup.appendChild(rotateWrap);
-				// Front cover explicit open/close buttons (if clips exist)
-				const frontClips = animationClips.filter(isFrontCoverClip);
-				const latchClips = animationClips.filter(isLatchClip);
-				if (frontClips.length > 0) {
-					const btnOpenFront = document.createElement('button');
-					btnOpenFront.textContent = 'Open front_cover';
-					btnOpenFront.style.display = 'block';
-					btnOpenFront.style.marginBottom = '5px';
-					btnOpenFront.onclick = () => playFrontCoverDirection(1, frontClips, latchClips);
-					animGroup.appendChild(btnOpenFront);
-					const btnCloseFront = document.createElement('button');
-					btnCloseFront.textContent = 'Close front_cover';
-					btnCloseFront.style.display = 'block';
-					btnCloseFront.style.marginBottom = '12px';
-					btnCloseFront.onclick = () => playFrontCoverDirection(-1, frontClips, latchClips);
-					animGroup.appendChild(btnCloseFront);
-				}
-				// Latch explicit open/close buttons (if clips exist)
-				if (latchClips.length > 0) {
-					const btnOpenLatch = document.createElement('button');
-					btnOpenLatch.textContent = 'Open latch';
-					btnOpenLatch.style.display = 'block';
-					btnOpenLatch.style.marginBottom = '5px';
-					btnOpenLatch.onclick = () => playLatchDirection(1, latchClips);
-					animGroup.appendChild(btnOpenLatch);
-					const btnCloseLatch = document.createElement('button');
-					btnCloseLatch.textContent = 'Close latch';
-					btnCloseLatch.style.display = 'block';
-					btnCloseLatch.style.marginBottom = '12px';
-					btnCloseLatch.onclick = () => playLatchDirection(-1, latchClips);
-					animGroup.appendChild(btnCloseLatch);
-				}
-
-				// Only create page buttons for page1 and page2
-				animationClips.forEach((clip) => {
-					const isPage = isPageClip(clip);
-					if (!isPage) return;
-					const pageName = getPrimaryPageName(clip) || (clip.name || `page`);
-					const pageIndex = extractPageIndex(pageName);
-					if (pageIndex > 2) return; // restrict to page1 and page2 only
-					// Open button (forward)
-					const btnOpen = document.createElement('button');
-					btnOpen.textContent = `Open ${pageName}`;
-					btnOpen.style.display = 'block';
-					btnOpen.style.marginBottom = '5px';
-					btnOpen.onclick = () => playClipDirection(clip, 1, true);
-					animGroup.appendChild(btnOpen);
-					// Close button (reverse)
-					const btnClose = document.createElement('button');
-					btnClose.textContent = `Close ${pageName}`;
-					btnClose.style.display = 'block';
-					btnClose.style.marginBottom = '12px';
-					btnClose.onclick = () => playClipDirection(clip, -1, true);
-					animGroup.appendChild(btnClose);
-					// Initialize page state as closed by default
-					pageOpenByClip.set(clip, false);
-					// Initialize toggle map though not used for explicit open/close
-					nextReverseByClip.set(clip, false);
-				});
-				// Append dropdown to the buttons container
-				animButtonsContainer.appendChild(animGroup);
-			}
+			// Menu removed per request: do not create any animation or pan UI
+			// Initialize page state map even without UI
+			getOrderedPageClips().forEach((clip) => {
+				pageOpenByClip.set(clip, false);
+				nextReverseByClip.set(clip, false);
+			});
 		}
 	};
 	if (typeof urlOrBuffer === 'string') {
@@ -336,26 +347,56 @@ function playClipDirection(clip, direction, enforcePageState = false) {
 			console.warn('Cannot turn pages while the book is closed');
 			return;
 		}
-		// Enforce sequential opening: cannot open page N unless all previous pages are open
+		// If opening a lower-index page while later pages are open, close later pages first
 		if (direction > 0) {
 			const ordered = getOrderedPageClips();
-			const idx = ordered.indexOf(clip);
-			if (idx > 0) {
-				for (let i = 0; i < idx; i++) {
-					if (pageOpenByClip.get(ordered[i]) !== true) {
-						console.warn('Open previous pages first');
-						return;
+			let idx = ordered.indexOf(clip);
+			if (idx > -1) {
+				const laterOpen = [];
+				for (let i = ordered.length - 1; i > idx; i--) {
+					if (pageOpenByClip.get(ordered[i]) === true) laterOpen.push(ordered[i]);
+				}
+				if (laterOpen.length > 0) {
+					// Close open later pages in descending order, then proceed to target
+					closePagesThen(() => {
+						// After closing later pages, ensure previous pages are open smoothly
+						let needPrevOpen = false;
+						for (let i = 0; i < idx; i++) {
+							if (pageOpenByClip.get(ordered[i]) !== true) { needPrevOpen = true; break; }
+						}
+						if (needPrevOpen) {
+							openPagesThen(clip, () => playClipDirection(clip, 1, true));
+						} else {
+							playClipDirection(clip, 1, true);
+						}
+					}, laterOpen);
+					return;
+				}
+			}
+			// Smoothly open all previous pages if needed
+			const ordered2 = getOrderedPageClips();
+			const idx2 = ordered2.indexOf(clip);
+			if (idx2 > 0) {
+				let needOpen = false;
+				for (let i = 0; i < idx2; i++) {
+					if (pageOpenByClip.get(ordered2[i]) !== true) {
+						needOpen = true;
+						break;
 					}
+				}
+				if (needOpen) {
+					openPagesThen(clip, () => playClipDirection(clip, direction, true));
+					return;
 				}
 			}
 		}
 		// Enforce sequential closing: cannot close page N if any later page is open
 		if (direction < 0) {
-			const ordered = getOrderedPageClips();
-			const idx = ordered.indexOf(clip);
-			if (idx !== -1) {
-				for (let i = idx + 1; i < ordered.length; i++) {
-					if (pageOpenByClip.get(ordered[i]) === true) {
+			const ordered3 = getOrderedPageClips();
+			const idx3 = ordered3.indexOf(clip);
+			if (idx3 !== -1) {
+				for (let i = idx3 + 1; i < ordered3.length; i++) {
+					if (pageOpenByClip.get(ordered3[i]) === true) {
 						console.warn('Close later pages first');
 						return;
 					}
@@ -454,6 +495,39 @@ function playFrontCoverDirection(direction, frontClips, latchClips) {
 			playingDirectionByAction.set(action, 1);
 		}
 	});
+
+	// Play spline animation together with front cover
+	if (animationClips) {
+		// Find spline animation clips by name or by track targeting 'spline'
+		const splineClips = animationClips.filter(clip => {
+			if (clip.name && clip.name.toLowerCase().includes('spline')) return true;
+			return clip.tracks.some(track => track.name.split('.')[0] === 'spline');
+		});
+		if (splineClips.length === 0) {
+			console.warn('No spline animation clips found to play with front cover.');
+		} else {
+			console.log('Playing spline animation(s) with front cover:', splineClips.map(c => c.name));
+		}
+		splineClips.forEach(clip => {
+			const action = mixer.clipAction(clip);
+			action.enabled = true;
+			action.setLoop(THREE.LoopOnce, 1);
+			action.clampWhenFinished = true;
+			if (direction < 0) {
+				action.time = clip.duration;
+				action.paused = false;
+				action.timeScale = -1;
+				action.play();
+				playingDirectionByAction.set(action, -1);
+			} else {
+				action.reset();
+				action.timeScale = 1;
+				action.play();
+				playingDirectionByAction.set(action, 1);
+			}
+		});
+	}
+
 	// If we are closing the front cover, then after it fully closes, also close the latch
 	if (direction < 0 && latchClips && latchClips.length > 0 && startedFrontActions.length > 0) {
 		const remainingFront = new Set(startedFrontActions);
@@ -567,6 +641,37 @@ function animate() {
 	requestAnimationFrame(animate);
 	if (mixer) mixer.update(0.016); // ~60fps
 	controls.update();
+	// Enforce pan boundary (if enabled)
+	if (panLimitEnabled && panLimitRadius > 0 && panOriginTarget) {
+		const curT = controls.target;
+		const delta = curT.clone().sub(panOriginTarget);
+		const dist = delta.length();
+		if (dist > panLimitRadius) {
+			delta.setLength(panLimitRadius);
+			const clampedTarget = panOriginTarget.clone().add(delta);
+			const adjust = clampedTarget.clone().sub(curT);
+			controls.target.copy(clampedTarget);
+			camera.position.add(adjust);
+		}
+	}
+	// Update camera HUD at ~10 fps to reduce cost
+	if (cameraInfoEl) {
+		const now = performance.now();
+		if (now - lastCamHudUpdate > 100) {
+			lastCamHudUpdate = now;
+			const p = camera.position;
+			const t = controls ? controls.target : new THREE.Vector3();
+			const rot = camera.rotation;
+			const fmt = (n)=> (Math.abs(n) < 1e-4 ? 0 : n).toFixed(3);
+			cameraInfoEl.innerHTML = `
+				<div class="row"><span class="label">pos</span><span>[${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}]</span></div>
+				<div class="row"><span class="label">target</span><span>[${fmt(t.x)}, ${fmt(t.y)}, ${fmt(t.z)}]</span></div>
+				<div class="row"><span class="label">rot</span><span>[${fmt(rot.x)}, ${fmt(rot.y)}, ${fmt(rot.z)}]</span></div>
+				<div class="row"><span class="label">fov</span><span>${fmt(camera.fov)}</span></div>
+				<div class="row"><span class="copy-hint">tap to copy</span></div>
+			`;
+		}
+	}
 	renderer.render(scene, camera);
 }
 
@@ -581,6 +686,14 @@ window.addEventListener('DOMContentLoaded', () => {
 	if (fileInput) fileInput.style.display = 'none';
 	if (playAnimBtn) playAnimBtn.style.display = 'none';
 	if (openBookBtn) openBookBtn.style.display = 'none';
+	if (cameraInfoEl) {
+		cameraInfoEl.addEventListener('click', () => {
+			try {
+				const txt = cameraInfoEl.textContent || '';
+				navigator.clipboard && navigator.clipboard.writeText(txt);
+			} catch (e) {}
+		}, { passive: true });
+	}
 	// Ensure no handlers remain
 	if (openFileBtn) openFileBtn.onclick = null;
 	if (fileInput) fileInput.onchange = null;
