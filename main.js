@@ -49,6 +49,7 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 let scene, camera, renderer, controls, currentModel;
 let mixer = null, animationClips = null;
 let animButtonsContainer = null;
+const SHOW_ANIM_CONTROLS = false; // hide control menu everywhere
 // Track per-clip toggle state: false -> forward next, true -> reverse next
 const nextReverseByClip = new Map();
 // Toggle for Open Book (latch + front_cover) sequence
@@ -66,6 +67,10 @@ let ambientLightRef = null;
 let directionalLightRef = null;
 let cameraInfoEl = null;
 let lastCamHudUpdate = 0;
+// Raycast + tap detection (mobile)
+let raycaster = null;
+let _touchDownPos = null;
+let _touchDownTime = 0;
 // Pan boundary settings (persisted)
 let panLimitEnabled = true;
 let panLimitRadius = 10; // world units
@@ -102,6 +107,10 @@ function isMobileDevice() {
 		/Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent)
 		|| (window.matchMedia && window.matchMedia('(pointer: coarse)').matches)
 	);
+}
+
+function isAnyAnimationPlaying() {
+	return playingDirectionByAction && playingDirectionByAction.size > 0;
 }
 
 // Produce a ready-to-paste snippet for setting the current camera view
@@ -173,6 +182,9 @@ function initViewer() {
 	renderer.setSize(container.clientWidth, container.clientHeight);
 	container.appendChild(renderer.domElement);
 
+	// Raycaster for mobile tap picking
+	raycaster = new THREE.Raycaster();
+
 	const ambientLight = new THREE.AmbientLight(0xffffff, 2.0);
 	scene.add(ambientLight);
 	const directionalLight = new THREE.DirectionalLight(0xffffff, 2.0);
@@ -205,7 +217,7 @@ function initViewer() {
 		// Set maximum zoom-out distance from provided far view
 		const maxOutPos = new THREE.Vector3(-6.756, 2.575, 34.772);
 		const maxOutTarget = new THREE.Vector3(-8.627, 0.340, -4.007);
-		controls.maxDistance = maxOutPos.distanceTo(maxOutTarget);
+		controls.maxDistance = maxOutPos.distanceTo(maxOutTarget) * 1.2; // a little more zoom-out on mobile
 	} else {
 		// Desktop (PC): set maximum zoom-in level per request
 		const pcMaxInPos = new THREE.Vector3(0.733, 1.071, 7.208);
@@ -217,6 +229,46 @@ function initViewer() {
 		controls.maxDistance = pcMaxOutPos.distanceTo(pcMaxOutTarget);
 		controls.zoomSpeed = 1.0;
 	}
+
+	// Mobile tap-to-toggle (pages, front cover, latch)
+	if (isMobileDevice()) {
+		const canvas = renderer.domElement;
+		canvas.addEventListener('pointerdown', (ev) => {
+			if (ev.pointerType !== 'touch') return;
+			_touchDownPos = { x: ev.clientX, y: ev.clientY };
+			_touchDownTime = performance.now();
+		}, { passive: true });
+		canvas.addEventListener('pointerup', (ev) => {
+			if (ev.pointerType !== 'touch') return;
+			const tNow = performance.now();
+			const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
+			const dt = tNow - _touchDownTime;
+			if (_touchDownPos && moved < 8 && dt < 350) {
+				handleMobileTap(ev);
+			}
+			_touchDownPos = null;
+		}, { passive: true });
+	} else {
+		// Desktop/pen click-to-toggle with left button
+		const canvas = renderer.domElement;
+		canvas.addEventListener('pointerdown', (ev) => {
+			if (ev.pointerType !== 'mouse' && ev.pointerType !== 'pen') return;
+			if (ev.button !== 0) return; // left click only
+			_touchDownPos = { x: ev.clientX, y: ev.clientY };
+			_touchDownTime = performance.now();
+		}, { passive: true });
+		canvas.addEventListener('pointerup', (ev) => {
+			if (ev.pointerType !== 'mouse' && ev.pointerType !== 'pen') return;
+			if (ev.button !== 0) return; // left click only
+			const tNow = performance.now();
+			const moved = _touchDownPos ? Math.hypot(ev.clientX - _touchDownPos.x, ev.clientY - _touchDownPos.y) : 1e9;
+			const dt = tNow - _touchDownTime;
+			if (_touchDownPos && moved < 6 && dt < 300) {
+				handlePointerPick(ev.clientX, ev.clientY);
+			}
+			_touchDownPos = null;
+		}, { passive: true });
+	}
 	animate();
 	loadGLB('book.glb');
 
@@ -226,6 +278,119 @@ function initViewer() {
 		panOriginTarget = controls.target.clone();
 	}
 
+	// Hide control menu on all devices
+	if (animButtonsContainer) {
+		animButtonsContainer.style.display = 'none';
+	}
+
+}
+
+function getFrontClips() {
+	return (animationClips || []).filter(isFrontCoverClip);
+}
+
+function getLatchClips() {
+	return (animationClips || []).filter(isLatchClip);
+}
+
+function findPageClipForNodeName(nodeName) {
+	if (!animationClips || !nodeName) return null;
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		for (const track of clip.tracks) {
+			const n = track.name.split('.')[0];
+			if (n === nodeName) return clip;
+		}
+	}
+	return null;
+}
+
+function normalizeName(str) {
+	if (!str || typeof str !== 'string') return '';
+	// Lowercase, remove spaces, strip Blender instance suffix like .001
+	return str.toLowerCase().replace(/\s+/g, '').replace(/\.[0-9]+$/, '');
+}
+
+function getAncestorNames(obj) {
+	const names = [];
+	let cur = obj;
+	while (cur) {
+		if (cur.name) names.push(cur.name);
+		cur = cur.parent;
+	}
+	return names;
+}
+
+function findPageClipForObject(obj) {
+	if (!animationClips || !obj) return null;
+	const ancestorNames = getAncestorNames(obj).map(normalizeName);
+	// First pass: match against clip track target node names
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		for (const track of clip.tracks) {
+			const nodeName = track.name.split('.')[0];
+			const tn = normalizeName(nodeName);
+			if (ancestorNames.includes(tn)) return clip;
+		}
+	}
+	// Second pass: match against primary page name or clip name
+	for (const clip of animationClips) {
+		if (!isPageClip(clip)) continue;
+		const primary = getPrimaryPageName(clip) || clip.name || '';
+		const pn = normalizeName(primary);
+		if (pn && ancestorNames.includes(pn)) return clip;
+	}
+	return null;
+}
+
+function findNamedAncestor(obj) {
+	let cur = obj;
+	while (cur) {
+		if (cur.name && typeof cur.name === 'string' && cur.name.length > 0) return cur;
+		cur = cur.parent;
+	}
+	return null;
+}
+
+function handleMobileTap(ev) {
+	handlePointerPick(ev.clientX, ev.clientY);
+}
+
+function handlePointerPick(clientX, clientY) {
+	if (!camera || !currentModel || !raycaster) return;
+	if (isAnyAnimationPlaying()) return;
+	const canvas = renderer.domElement;
+	const rect = canvas.getBoundingClientRect();
+	const x = ((clientX - rect.left) / rect.width) * 2 - 1;
+	const y = -((clientY - rect.top) / rect.height) * 2 + 1;
+	raycaster.setFromCamera({ x, y }, camera);
+	const hits = raycaster.intersectObject(currentModel, true);
+	if (!hits || hits.length === 0) return;
+	const named = findNamedAncestor(hits[0].object);
+	if (!named) return;
+	const name = named.name;
+	// Decide action based on named node
+	if (name === 'front_cover') {
+		const dir = frontCoverOpen ? -1 : 1;
+		const frontClips = getFrontClips();
+		const latchClips = getLatchClips();
+		playFrontCoverDirection(dir, frontClips, latchClips);
+		return;
+	}
+	if (name === 'latch') {
+		const dir = latchOpen ? -1 : 1;
+		const latchClips = getLatchClips();
+		playLatchDirection(dir, latchClips);
+		return;
+	}
+	// Pages: try to resolve the tapped object (or its ancestors) to a page clip
+	const pageClip = findPageClipForObject(hits[0].object);
+	if (pageClip) {
+		const isOpen = pageOpenByClip.get(pageClip) === true;
+		const dir = isOpen ? -1 : 1;
+		playClipDirection(pageClip, dir, true);
+		return;
+	}
 }
 
 function loadGLB(urlOrBuffer) {
@@ -309,8 +474,8 @@ function loadGLB(urlOrBuffer) {
 			});
 			console.groupEnd();
 
-			// Generate buttons for each animation
-			if (animButtonsContainer) {
+			// Generate buttons for each animation (disabled/hidden)
+			if (SHOW_ANIM_CONTROLS && animButtonsContainer && !isMobileDevice()) {
 				animButtonsContainer.innerHTML = '';
 				// Create dropdown container
 				const animGroup = document.createElement('details');
@@ -350,13 +515,13 @@ function loadGLB(urlOrBuffer) {
 					btnOpenFront.textContent = 'Open front_cover';
 					btnOpenFront.style.display = 'block';
 					btnOpenFront.style.marginBottom = '5px';
-					btnOpenFront.onclick = () => playFrontCoverDirection(1, frontClips, latchClips);
+					btnOpenFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(1, frontClips, latchClips); };
 					animGroup.appendChild(btnOpenFront);
 					const btnCloseFront = document.createElement('button');
 					btnCloseFront.textContent = 'Close front_cover';
 					btnCloseFront.style.display = 'block';
 					btnCloseFront.style.marginBottom = '12px';
-					btnCloseFront.onclick = () => playFrontCoverDirection(-1, frontClips, latchClips);
+					btnCloseFront.onclick = () => { if (isAnyAnimationPlaying()) return; playFrontCoverDirection(-1, frontClips, latchClips); };
 					animGroup.appendChild(btnCloseFront);
 				}
 				// Latch explicit open/close buttons (if clips exist)
@@ -365,13 +530,13 @@ function loadGLB(urlOrBuffer) {
 					btnOpenLatch.textContent = 'Open latch';
 					btnOpenLatch.style.display = 'block';
 					btnOpenLatch.style.marginBottom = '5px';
-					btnOpenLatch.onclick = () => playLatchDirection(1, latchClips);
+					btnOpenLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(1, latchClips); };
 					animGroup.appendChild(btnOpenLatch);
 					const btnCloseLatch = document.createElement('button');
 					btnCloseLatch.textContent = 'Close latch';
 					btnCloseLatch.style.display = 'block';
 					btnCloseLatch.style.marginBottom = '12px';
-					btnCloseLatch.onclick = () => playLatchDirection(-1, latchClips);
+					btnCloseLatch.onclick = () => { if (isAnyAnimationPlaying()) return; playLatchDirection(-1, latchClips); };
 					animGroup.appendChild(btnCloseLatch);
 				}
 
@@ -383,14 +548,14 @@ function loadGLB(urlOrBuffer) {
 					btnOpen.textContent = `Open ${pageName}`;
 					btnOpen.style.display = 'block';
 					btnOpen.style.marginBottom = '5px';
-					btnOpen.onclick = () => playClipDirection(clip, 1, true);
+					btnOpen.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, 1, true); };
 					animGroup.appendChild(btnOpen);
 					// Close button (reverse)
 					const btnClose = document.createElement('button');
 					btnClose.textContent = `Close ${pageName}`;
 					btnClose.style.display = 'block';
 					btnClose.style.marginBottom = '12px';
-					btnClose.onclick = () => playClipDirection(clip, -1, true);
+					btnClose.onclick = () => { if (isAnyAnimationPlaying()) return; playClipDirection(clip, -1, true); };
 					animGroup.appendChild(btnClose);
 					// Initialize page state as closed by default
 					pageOpenByClip.set(clip, false);
