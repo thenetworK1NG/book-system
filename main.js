@@ -66,20 +66,35 @@ let ambientLightRef = null;
 let directionalLightRef = null;
 let cameraInfoEl = null;
 let lastCamHudUpdate = 0;
-// Pan boundary settings (defaults enabled)
-// Defaults per user: origin [-9.121, 0.358, -3.984], radius 10, enabled true
+// Pan boundary settings (persisted)
 let panLimitEnabled = true;
 let panLimitRadius = 10; // world units
-let panOriginTarget = new THREE.Vector3(-9.121, 0.358, -3.984); // THREE.Vector3
+let panOriginTarget = new THREE.Vector3(-9.121, 0.358, -3.984); // default origin
 
 function loadPanSettings() {
-	// Intentionally disable persisted overrides; keep defaults requested by user
-	return;
+	try {
+		const enabled = localStorage.getItem('panLimitEnabled');
+		const radius = localStorage.getItem('panLimitRadius');
+		const originStr = localStorage.getItem('panOriginTarget');
+		if (enabled !== null) panLimitEnabled = enabled === 'true';
+		if (radius !== null) panLimitRadius = parseFloat(radius) || 0;
+		if (originStr) {
+			const arr = JSON.parse(originStr);
+			if (Array.isArray(arr) && arr.length === 3) {
+				panOriginTarget = new THREE.Vector3(arr[0], arr[1], arr[2]);
+			}
+		}
+	} catch {}
 }
 
 function savePanSettings() {
-	// Persistence disabled per request to fix defaults; no-op
-	return;
+	try {
+		localStorage.setItem('panLimitEnabled', String(panLimitEnabled));
+		localStorage.setItem('panLimitRadius', String(panLimitRadius));
+		if (panOriginTarget) {
+			localStorage.setItem('panOriginTarget', JSON.stringify([panOriginTarget.x, panOriginTarget.y, panOriginTarget.z]));
+		}
+	} catch {}
 }
 
 function isMobileDevice() {
@@ -125,12 +140,6 @@ function fitCameraToObject(camera, controls, object3D, offset = 1.2) {
 function initViewer() {
 	const container = document.getElementById('viewer');
 	animButtonsContainer = document.getElementById('animButtons');
-	// Remove the menu per request: hide and null out the container so no UI is built
-	if (animButtonsContainer) {
-		animButtonsContainer.style.display = 'none';
-		animButtonsContainer.innerHTML = '';
-		animButtonsContainer = null;
-	}
 	cameraInfoEl = document.getElementById('cameraInfo');
 	scene = new THREE.Scene();
 	scene.background = new THREE.Color(0xf0f0f0);
@@ -276,12 +285,98 @@ function loadGLB(urlOrBuffer) {
 			});
 			console.groupEnd();
 
-			// Menu removed per request: do not create any animation or pan UI
-			// Initialize page state map even without UI
-			getOrderedPageClips().forEach((clip) => {
-				pageOpenByClip.set(clip, false);
-				nextReverseByClip.set(clip, false);
-			});
+			// Generate buttons for each animation
+			if (animButtonsContainer) {
+				animButtonsContainer.innerHTML = '';
+				// Create dropdown container
+				const animGroup = document.createElement('details');
+				animGroup.style.maxWidth = '220px';
+				const animSummary = document.createElement('summary');
+				animSummary.textContent = 'Model animations';
+				animSummary.style.cursor = 'pointer';
+				animGroup.appendChild(animSummary);
+				// Rotation toggle inside dropdown (hidden on mobile)
+				if (!isMobileDevice()) {
+					const rotateWrap = document.createElement('label');
+					rotateWrap.style.display = 'block';
+					rotateWrap.style.margin = '6px 0 12px 0';
+					rotateWrap.style.font = '12px sans-serif';
+					const rotateToggle = document.createElement('input');
+					rotateToggle.type = 'checkbox';
+					rotateToggle.checked = controls ? !!controls.enableRotate : false;
+					rotateWrap.appendChild(rotateToggle);
+					rotateWrap.appendChild(document.createTextNode(' Enable rotation'));
+					rotateToggle.addEventListener('change', () => {
+						const enable = !!rotateToggle.checked;
+						if (controls) {
+							controls.enableRotate = enable;
+							if (THREE.TOUCH) {
+								controls.touches.ONE = enable ? THREE.TOUCH.ROTATE : THREE.TOUCH.PAN;
+								controls.touches.TWO = THREE.TOUCH.DOLLY_PAN;
+							}
+						}
+					});
+					animGroup.appendChild(rotateWrap);
+				}
+				// Front cover explicit open/close buttons (if clips exist)
+				const frontClips = animationClips.filter(isFrontCoverClip);
+				const latchClips = animationClips.filter(isLatchClip);
+				if (frontClips.length > 0) {
+					const btnOpenFront = document.createElement('button');
+					btnOpenFront.textContent = 'Open front_cover';
+					btnOpenFront.style.display = 'block';
+					btnOpenFront.style.marginBottom = '5px';
+					btnOpenFront.onclick = () => playFrontCoverDirection(1, frontClips, latchClips);
+					animGroup.appendChild(btnOpenFront);
+					const btnCloseFront = document.createElement('button');
+					btnCloseFront.textContent = 'Close front_cover';
+					btnCloseFront.style.display = 'block';
+					btnCloseFront.style.marginBottom = '12px';
+					btnCloseFront.onclick = () => playFrontCoverDirection(-1, frontClips, latchClips);
+					animGroup.appendChild(btnCloseFront);
+				}
+				// Latch explicit open/close buttons (if clips exist)
+				if (latchClips.length > 0) {
+					const btnOpenLatch = document.createElement('button');
+					btnOpenLatch.textContent = 'Open latch';
+					btnOpenLatch.style.display = 'block';
+					btnOpenLatch.style.marginBottom = '5px';
+					btnOpenLatch.onclick = () => playLatchDirection(1, latchClips);
+					animGroup.appendChild(btnOpenLatch);
+					const btnCloseLatch = document.createElement('button');
+					btnCloseLatch.textContent = 'Close latch';
+					btnCloseLatch.style.display = 'block';
+					btnCloseLatch.style.marginBottom = '12px';
+					btnCloseLatch.onclick = () => playLatchDirection(-1, latchClips);
+					animGroup.appendChild(btnCloseLatch);
+				}
+
+				// Create page buttons for all detected pages in order
+				getOrderedPageClips().forEach((clip) => {
+					const pageName = getPrimaryPageName(clip) || (clip.name || `page`);
+					// Open button (forward)
+					const btnOpen = document.createElement('button');
+					btnOpen.textContent = `Open ${pageName}`;
+					btnOpen.style.display = 'block';
+					btnOpen.style.marginBottom = '5px';
+					btnOpen.onclick = () => playClipDirection(clip, 1, true);
+					animGroup.appendChild(btnOpen);
+					// Close button (reverse)
+					const btnClose = document.createElement('button');
+					btnClose.textContent = `Close ${pageName}`;
+					btnClose.style.display = 'block';
+					btnClose.style.marginBottom = '12px';
+					btnClose.onclick = () => playClipDirection(clip, -1, true);
+					animGroup.appendChild(btnClose);
+					// Initialize page state as closed by default
+					pageOpenByClip.set(clip, false);
+					// Initialize toggle map though not used for explicit open/close
+					nextReverseByClip.set(clip, false);
+				});
+				// Pan boundary menu removed per request; settings use defaults and/or persisted values.
+				// Append dropdown to the buttons container
+				animButtonsContainer.appendChild(animGroup);
+			}
 		}
 	};
 	if (typeof urlOrBuffer === 'string') {
