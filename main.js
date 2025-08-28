@@ -104,6 +104,20 @@ function isMobileDevice() {
 	);
 }
 
+// Produce a ready-to-paste snippet for setting the current camera view
+function formatCameraSnippet() {
+	const p = camera && camera.position ? camera.position : { x: 0, y: 0, z: 0 };
+	const t = controls && controls.target ? controls.target : { x: 0, y: 0, z: 0 };
+	const fov = camera && typeof camera.fov === 'number' ? camera.fov : 45;
+	const fmt = (n) => (Math.abs(n) < 1e-6 ? 0 : Number(n)).toFixed(3);
+	return [
+		`camera.position.set(${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)});`,
+		`controls.target.set(${fmt(t.x)}, ${fmt(t.y)}, ${fmt(t.z)});`,
+		`camera.fov = ${fmt(fov)};`,
+		`camera.updateProjectionMatrix();`
+	].join('\n');
+}
+
 function fitCameraToObject(camera, controls, object3D, offset = 1.2) {
 	// Compute bounding box of the object
 	const box = new THREE.Box3().setFromObject(object3D);
@@ -192,6 +206,16 @@ function initViewer() {
 		const maxOutPos = new THREE.Vector3(-6.756, 2.575, 34.772);
 		const maxOutTarget = new THREE.Vector3(-8.627, 0.340, -4.007);
 		controls.maxDistance = maxOutPos.distanceTo(maxOutTarget);
+	} else {
+		// Desktop (PC): set maximum zoom-in level per request
+		const pcMaxInPos = new THREE.Vector3(0.733, 1.071, 7.208);
+		const pcMaxInTarget = new THREE.Vector3(0.733, 0.702, -3.820);
+		controls.minDistance = pcMaxInPos.distanceTo(pcMaxInTarget);
+		// PC maximum zoom-out based on provided view
+		const pcMaxOutPos = new THREE.Vector3(-5.565, 0.657, 31.426);
+		const pcMaxOutTarget = new THREE.Vector3(-5.565, -0.527, -3.955);
+		controls.maxDistance = pcMaxOutPos.distanceTo(pcMaxOutTarget);
+		controls.zoomSpeed = 1.0;
 	}
 	animate();
 	loadGLB('book.glb');
@@ -758,12 +782,14 @@ function animate() {
 			const t = controls ? controls.target : new THREE.Vector3();
 			const rot = camera.rotation;
 			const fmt = (n)=> (Math.abs(n) < 1e-4 ? 0 : n).toFixed(3);
+			const desktop = !isMobileDevice();
 			cameraInfoEl.innerHTML = `
 				<div class="row"><span class="label">pos</span><span>[${fmt(p.x)}, ${fmt(p.y)}, ${fmt(p.z)}]</span></div>
 				<div class="row"><span class="label">target</span><span>[${fmt(t.x)}, ${fmt(t.y)}, ${fmt(t.z)}]</span></div>
 				<div class="row"><span class="label">rot</span><span>[${fmt(rot.x)}, ${fmt(rot.y)}, ${fmt(rot.z)}]</span></div>
 				<div class="row"><span class="label">fov</span><span>${fmt(camera.fov)}</span></div>
-				<div class="row"><span class="copy-hint">tap to copy</span></div>
+				<div class="row" style="margin-top:6px"><button id="copyCamBtn" style="cursor:pointer;padding:4px 8px;border-radius:4px;border:1px solid #999;background:#1e1e1e;color:#fff;">Copy coords</button></div>
+				${isMobileDevice() ? `<div class=\"row\"><span class=\"copy-hint\">tap to copy</span></div>` : ''}
 			`;
 		}
 	}
@@ -782,12 +808,25 @@ window.addEventListener('DOMContentLoaded', () => {
 	if (playAnimBtn) playAnimBtn.style.display = 'none';
 	if (openBookBtn) openBookBtn.style.display = 'none';
 	if (cameraInfoEl) {
-		cameraInfoEl.addEventListener('click', () => {
-			try {
-				const txt = cameraInfoEl.textContent || '';
-				navigator.clipboard && navigator.clipboard.writeText(txt);
-			} catch (e) {}
-		}, { passive: true });
+		// Mobile: tap anywhere on the HUD to copy its text
+		if (isMobileDevice()) {
+			cameraInfoEl.addEventListener('click', () => {
+				try {
+					const txt = cameraInfoEl.textContent || '';
+					if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(txt);
+				} catch (e) {}
+			}, { passive: true });
+		}
+		// All devices: delegated click for the explicit button
+		cameraInfoEl.addEventListener('click', (ev) => {
+			const el = ev.target;
+			if (el && el.id === 'copyCamBtn') {
+				try {
+					const snippet = formatCameraSnippet();
+					if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(snippet);
+				} catch (e) {}
+			}
+		});
 	}
 	// Ensure no handlers remain
 	if (openFileBtn) openFileBtn.onclick = null;

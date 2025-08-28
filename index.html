@@ -21,10 +21,14 @@
             border-radius: 6px;
             max-width: calc(100vw - 20px);
             user-select: none;
+            /* Let wheel events pass through HUD, except on interactive elements like buttons */
+            pointer-events: none;
+            display: none; /* hide on phone and PC */
         }
         #cameraInfo .row { display: flex; gap: 6px; align-items: center; }
         #cameraInfo .label { opacity: 0.75; }
         #cameraInfo .copy-hint { opacity: 0.55; font-style: italic; }
+        #cameraInfo button { pointer-events: auto; }
         @media (max-width: 768px) {
             #cameraInfo { font-size: 11px; padding: 6px 8px; }
         }
